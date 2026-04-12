@@ -1,19 +1,15 @@
 
 from dotenv import load_dotenv
-from anthropic import Anthropic
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
-from typing import List, Dict, TypedDict
+from typing import List, Dict
 from contextlib import AsyncExitStack
 import json
 import asyncio
+import os
+from openai import OpenAI
 
 load_dotenv()
-
-class ToolDefinition(TypedDict):
-    name: str
-    description: str
-    input_schema: dict
 
 class MCP_ChatBot:
 
@@ -21,8 +17,8 @@ class MCP_ChatBot:
         # Initialize session and client objects
         self.sessions: List[ClientSession] = [] # new
         self.exit_stack = AsyncExitStack() # new
-        self.anthropic = Anthropic()
-        self.available_tools: List[ToolDefinition] = [] # new
+        self.openai = OpenAI(api_key=os.getenv("GITHUB_TOKEN"), base_url=os.getenv("GITHUB_ENDPOINT"))
+        self.available_tools: List[dict] = [] # new
         self.tool_to_session: Dict[str, ClientSession] = {} # new
 
 
@@ -48,9 +44,12 @@ class MCP_ChatBot:
             for tool in tools: # new
                 self.tool_to_session[tool.name] = session
                 self.available_tools.append({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "input_schema": tool.inputSchema
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.inputSchema
+                    }
                 })
         except Exception as e:
             print(f"Failed to connect to {server_name}: {e}")
@@ -70,50 +69,42 @@ class MCP_ChatBot:
             raise
     
     async def process_query(self, query):
-        messages = [{'role':'user', 'content':query}]
-        response = self.anthropic.messages.create(max_tokens = 2024,
-                                      model = 'claude-3-7-sonnet-20250219', 
-                                      tools = self.available_tools,
-                                      messages = messages)
-        process_query = True
-        while process_query:
-            assistant_content = []
-            for content in response.content:
-                if content.type =='text':
-                    print(content.text)
-                    assistant_content.append(content)
-                    if(len(response.content) == 1):
-                        process_query= False
-                elif content.type == 'tool_use':
-                    assistant_content.append(content)
-                    messages.append({'role':'assistant', 'content':assistant_content})
-                    tool_id = content.id
-                    tool_args = content.input
-                    tool_name = content.name
-                    
-    
-                    print(f"Calling tool {tool_name} with args {tool_args}")
-                    
-                    # Call a tool
-                    session = self.tool_to_session[tool_name] # new
-                    result = await session.call_tool(tool_name, arguments=tool_args)
-                    messages.append({"role": "user", 
-                                      "content": [
-                                          {
-                                              "type": "tool_result",
-                                              "tool_use_id":tool_id,
-                                              "content": result.content
-                                          }
-                                      ]
-                                    })
-                    response = self.anthropic.messages.create(max_tokens = 2024,
-                                      model = 'claude-3-7-sonnet-20250219', 
-                                      tools = self.available_tools,
-                                      messages = messages) 
-                    
-                    if(len(response.content) == 1 and response.content[0].type == "text"):
-                        print(response.content[0].text)
-                        process_query= False
+        messages = [{"role": "user", "content": query}]
+        
+        while True:
+            response = self.openai.chat.completions.create(
+                model='gpt-4o-mini',
+                messages=messages,
+                tools=self.available_tools,
+                #max_tokens=2024
+            )
+            
+            message = response.choices[0].message
+            messages.append(message)
+            
+            if not message.tool_calls:
+                print(message.content)
+                break
+            
+            for tool_call in message.tool_calls:
+                tool_name = tool_call.function.name
+                tool_args = json.loads(tool_call.function.arguments)
+                
+                print(f"Calling tool {tool_name} with args {tool_args}")
+                
+                session = self.tool_to_session[tool_name]
+                result = await session.call_tool(tool_name, arguments=tool_args)
+                
+                content_str = ""
+                for block in result.content:
+                    if block.type == "text":
+                        content_str += block.text
+                
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": content_str
+                })
 
     
     
