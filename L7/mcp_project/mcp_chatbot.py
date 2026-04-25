@@ -1,11 +1,12 @@
 from dotenv import load_dotenv
-from anthropic import Anthropic
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from contextlib import AsyncExitStack
 import json
 import asyncio
 import nest_asyncio
+import os
+from openai import OpenAI
 
 nest_asyncio.apply()
 
@@ -14,8 +15,8 @@ load_dotenv()
 class MCP_ChatBot:
     def __init__(self):
         self.exit_stack = AsyncExitStack()
-        self.anthropic = Anthropic()
-        # Tools list required for Anthropic API
+        self.openai = OpenAI(api_key=os.getenv("GITHUB_TOKEN"), base_url=os.getenv("GITHUB_ENDPOINT"))
+        # Tools list required for OpenAI API
         self.available_tools = []
         # Prompts list for quick display 
         self.available_prompts = []
@@ -43,28 +44,37 @@ class MCP_ChatBot:
                     self.available_tools.append({
                         "name": tool.name,
                         "description": tool.description,
-                        "input_schema": tool.inputSchema
+                        "parameters": tool.inputSchema
                     })
             
-                # List available prompts
-                prompts_response = await session.list_prompts()
-                if prompts_response and prompts_response.prompts:
-                    for prompt in prompts_response.prompts:
-                        self.sessions[prompt.name] = session
-                        self.available_prompts.append({
-                            "name": prompt.name,
-                            "description": prompt.description,
-                            "arguments": prompt.arguments
-                        })
-                # List available resources
-                resources_response = await session.list_resources()
-                if resources_response and resources_response.resources:
-                    for resource in resources_response.resources:
-                        resource_uri = str(resource.uri)
-                        self.sessions[resource_uri] = session
+                # List available prompts (optional - not all servers support this)
+                try:
+                    prompts_response = await session.list_prompts()
+                    if prompts_response and prompts_response.prompts:
+                        for prompt in prompts_response.prompts:
+                            self.sessions[prompt.name] = session
+                            self.available_prompts.append({
+                                "name": prompt.name,
+                                "description": prompt.description,
+                                "arguments": prompt.arguments
+                            })
+                except Exception as e:
+                    # Some servers don't support prompts - this is normal
+                    pass
+                
+                # List available resources (optional - not all servers support this)
+                try:
+                    resources_response = await session.list_resources()
+                    if resources_response and resources_response.resources:
+                        for resource in resources_response.resources:
+                            resource_uri = str(resource.uri)
+                            self.sessions[resource_uri] = session
+                except Exception as e:
+                    # Some servers don't support resources - this is normal
+                    pass
             
             except Exception as e:
-                print(f"Error {e}")
+                print(f"Error initializing server {server_name}: {e}")
                 
         except Exception as e:
             print(f"Error connecting to {server_name}: {e}")
@@ -81,49 +91,61 @@ class MCP_ChatBot:
             raise
     
     async def process_query(self, query):
-        messages = [{'role':'user', 'content':query}]
+        messages = [{"role": "user", "content": query}]
         
         while True:
-            response = self.anthropic.messages.create(
-                max_tokens = 2024,
-                model = 'claude-3-7-sonnet-20250219', 
-                tools = self.available_tools,
-                messages = messages
+            # Convert MCP tools to OpenAI format
+            openai_tools = []
+            for tool in self.available_tools:
+                openai_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool["description"],
+                        "parameters": tool["parameters"]
+                    }
+                })
+            
+            response = self.openai.chat.completions.create(
+                model='gpt-4o-mini',
+                messages=messages,
+                tools=openai_tools,
+                max_tokens=2024
             )
             
-            assistant_content = []
-            has_tool_use = False
+            message = response.choices[0].message
+            messages.append(message)
             
-            for content in response.content:
-                if content.type == 'text':
-                    print(content.text)
-                    assistant_content.append(content)
-                elif content.type == 'tool_use':
-                    has_tool_use = True
-                    assistant_content.append(content)
-                    messages.append({'role':'assistant', 'content':assistant_content})
-                    
-                    # Get session and call tool
-                    session = self.sessions.get(content.name)
-                    if not session:
-                        print(f"Tool '{content.name}' not found.")
-                        break
-                        
-                    result = await session.call_tool(content.name, arguments=content.input)
-                    messages.append({
-                        "role": "user", 
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": content.id,
-                                "content": result.content
-                            }
-                        ]
-                    })
-            
-            # Exit loop if no tool was used
-            if not has_tool_use:
+            if not message.tool_calls:
+                print(message.content)
                 break
+            
+            for tool_call in message.tool_calls:
+                tool_name = tool_call.function.name
+                tool_args = json.loads(tool_call.function.arguments)
+                
+                print(f"Calling tool {tool_name} with args {tool_args}")
+                
+                session = self.sessions.get(tool_name)
+                if not session:
+                    print(f"Tool '{tool_name}' not found.")
+                    continue
+                
+                result = await session.call_tool(tool_name, arguments=tool_args)
+                
+                # Extract text content from MCP result
+                content_str = ""
+                for block in result.content:
+                    if hasattr(block, 'text'):
+                        content_str += block.text
+                    elif hasattr(block, 'type') and block.type == 'text':
+                        content_str += block.text
+                
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": content_str
+                })
 
     async def get_resource(self, resource_uri):
         session = self.sessions.get(resource_uri)
