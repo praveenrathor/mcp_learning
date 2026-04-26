@@ -1,0 +1,10 @@
+{
+    "mcpServers": {
+      "research-remote": {
+        "url": "http://localhost:8002/mcp",
+        "headers": {
+          "Authorization": "Bearer ${env:RESEARCH_MCP_TOKEN}"
+        }
+      }
+    }
+  }
