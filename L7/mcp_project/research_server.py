@@ -191,3 +191,4 @@ Please present both detailed information about each paper and a high-level synth
 if __name__ == "__main__":
     # Initialize and run the server
     mcp.run(transport='streamable-http')
+    print("Research server is running on http://localhost:8002/mcp")
